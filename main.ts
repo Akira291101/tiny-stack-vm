@@ -1,153 +1,98 @@
-import fs from 'node:fs';
-import path from 'node:path';
-
-const STEP_LIMIT = 1_000_000;
-const OUTPUT_MAX = 65_536;
-const STACK_MAX = 256;
-const CALLS_MAX = 64;
-
-const imm = new Int8Array(256).fill(-1);
-const pops = new Uint8Array(256);
-const pushes = new Uint8Array(256);
-for (const o of [
-  [0x00, 0, 0, 0], [0x01, 1, 0, 1], [0x02, 4, 0, 1], [0x03, 0, 1, 0],
-  [0x04, 0, 1, 2], [0x05, 0, 2, 2], [0x06, 0, 2, 3], [0x07, 0, 3, 3],
-  [0x10, 0, 2, 1], [0x11, 0, 2, 1], [0x12, 0, 2, 1], [0x13, 0, 2, 1],
-  [0x14, 0, 2, 1], [0x15, 0, 2, 1], [0x16, 0, 2, 1], [0x17, 0, 1, 1],
-  [0x18, 0, 2, 1], [0x19, 0, 2, 1], [0x1a, 0, 2, 1], [0x1b, 0, 1, 1],
-  [0x1c, 0, 2, 1], [0x1d, 0, 2, 1], [0x1e, 0, 2, 1], [0x20, 0, 2, 1],
-  [0x21, 0, 2, 1], [0x22, 0, 2, 1], [0x30, 2, 0, 0], [0x31, 2, 1, 0],
-  [0x32, 2, 1, 0], [0x33, 2, 0, 0], [0x34, 0, 0, 0], [0x40, 0, 1, 1],
-  [0x41, 0, 2, 0], [0x50, 0, 1, 0], [0x51, 0, 1, 0], [0x52, 0, 0, 1],
-  [0x53, 0, 1, 0],
-]) { imm[o[0]] = o[1]; pops[o[0]] = o[2]; pushes[o[0]] = o[3]; }
-
-function run(program: Uint8Array, input: Uint8Array) {
-  const n = program.length;
-  const D = new Int32Array(STACK_MAX);
-  const C = new Int32Array(CALLS_MAX);
-  const M = new Int32Array(256);
-  const out = Buffer.alloc(OUTPUT_MAX);
-  let sp: number = 0, csp: number = 0, olen: number = 0, inPos: number = 0;
-  let pc: number = 0, steps: number = 0;
-  const done = (exit: number) => ({ stdout: out.subarray(0, olen), exit });
-  const trap = (code: number) => done(code);
-
-  for (;;) {
-    if (steps === STEP_LIMIT) return trap(10);
-    if (pc < 0 || pc >= n) return trap(9);
-    const op = program[pc];
-    const i = imm[op];
-    if (i < 0) return trap(5);
-    if (pc + i >= n) return trap(9);
-    steps++;
-    const next = pc + 1 + i;
-    if (sp < pops[op]) return trap(2);
-    if (sp - pops[op] + pushes[op] > STACK_MAX) return trap(3);
-    pc = next;
-
-    switch (op) {
-      case 0x00: return done(0);
-      case 0x01: D[sp++] = (program[next - 1] << 24) >> 24; break;
-      case 0x02:
-        D[sp++] = program[next - 4] | (program[next - 3] << 8) |
-          (program[next - 2] << 16) | (program[next - 1] << 24);
-        break;
-      case 0x03: sp--; break;
-      case 0x04: D[sp] = D[sp - 1]; sp++; break;
-      case 0x05: {
-        const t = D[sp - 1]; D[sp - 1] = D[sp - 2]; D[sp - 2] = t; break;
-      }
-      case 0x06: D[sp] = D[sp - 2]; sp++; break;
-      case 0x07: {
-        const a = D[sp - 3]; D[sp - 3] = D[sp - 2];
-        D[sp - 2] = D[sp - 1]; D[sp - 1] = a; break;
-      }
-      case 0x17: D[sp - 1] = -D[sp - 1] | 0; break;
-      case 0x1b: D[sp - 1] = ~D[sp - 1]; break;
-      case 0x30: case 0x31: case 0x32: {
-        const rel = ((program[next - 2] | (program[next - 1] << 8)) << 16) >> 16;
-        let take = true;
-        if (op !== 0x30) {
-          const v = D[--sp];
-          take = op === 0x31 ? v === 0 : v !== 0;
-        }
-        if (take) pc = next + rel;
-        break;
-      }
-      case 0x33:
-        if (csp === CALLS_MAX) return trap(7);
-        C[csp++] = next;
-        pc = program[next - 2] | (program[next - 1] << 8);
-        break;
-      case 0x34:
-        if (csp === 0) return trap(8);
-        pc = C[--csp];
-        break;
-      case 0x40: {
-        const addr = D[sp - 1];
-        if (addr < 0 || addr >= 256) return trap(6);
-        D[sp - 1] = M[addr];
-        break;
-      }
-      case 0x41: {
-        const addr = D[sp - 1], v = D[sp - 2];
-        if (addr < 0 || addr >= 256) return trap(6);
-        sp -= 2; M[addr] = v;
-        break;
-      }
-      case 0x50: {
-        const bytes = Buffer.from(String(D[sp - 1]), 'utf8');
-        if (olen + bytes.length > OUTPUT_MAX) return trap(11);
-        sp--; bytes.copy(out, olen); olen += bytes.length;
-        break;
-      }
-      case 0x51:
-        if (olen + 1 > OUTPUT_MAX) return trap(11);
-        out[olen++] = D[--sp] & 255;
-        break;
-      case 0x52: D[sp++] = inPos < input.length ? input[inPos++] : -1; break;
-      case 0x53: return done(D[--sp] & 255);
-      default: {
-        const b = D[sp - 1], a = D[sp - 2];
-        if ((op >= 0x13 && op <= 0x16) && b === 0) return trap(4);
-        let r: number;
-        switch (op) {
-          case 0x10: r = (a + b) | 0; break;
-          case 0x11: r = (a - b) | 0; break;
-          case 0x12: r = Math.imul(a, b); break;
-          case 0x13: r = a === -2147483648 && b === -1 ? a : (a / b) | 0; break;
-          case 0x14: r = b === -1 ? 0 : a % b | 0; break;
-          case 0x15: r = Math.floor((a >>> 0) / (b >>> 0)) | 0; break;
-          case 0x16: r = (a >>> 0) % (b >>> 0) | 0; break;
-          case 0x18: r = a & b; break;
-          case 0x19: r = a | b; break;
-          case 0x1a: r = a ^ b; break;
-          case 0x1c: r = a << (b & 31); break;
-          case 0x1d: r = a >> (b & 31); break;
-          case 0x1e: r = (a >>> (b & 31)) | 0; break;
-          case 0x20: r = a === b ? 1 : 0; break;
-          case 0x21: r = a < b ? 1 : 0; break;
-          default: r = (a >>> 0) < (b >>> 0) ? 1 : 0; break;
-        }
-        sp -= 2; D[sp++] = r;
-        break;
-      }
-    }
-  }
+const fs=require('node:fs'),path=require('node:path');
+const L=1e6,O=65536,S=256,K=64;
+const I=new Int8Array(256).fill(-1),P=new Uint8Array(256),U=new Uint8Array(256);
+for(const o of [[0,0,0,0],[1,1,0,1],[2,4,0,1],[3,0,1,0],[4,0,1,2],[5,0,2,2],[6,0,2,3],[7,0,3,3],[16,0,2,1],[17,0,2,1],[18,0,2,1],[19,0,2,1],[20,0,2,1],[21,0,2,1],[22,0,2,1],[23,0,1,1],[24,0,2,1],[25,0,2,1],[26,0,2,1],[27,0,1,1],[28,0,2,1],[29,0,2,1],[30,0,2,1],[32,0,2,1],[33,0,2,1],[34,0,2,1],[48,2,0,0],[49,2,1,0],[50,2,1,0],[51,2,0,0],[52,0,0,0],[64,0,1,1],[65,0,2,0],[80,0,1,0],[81,0,1,0],[82,0,0,1],[83,0,1,0]]){I[o[0]]=o[1];P[o[0]]=o[2];U[o[0]]=o[3];}
+function run(p,b){
+const n=p.length,D=new Int32Array(S),C=new Int32Array(K),M=new Int32Array(256),o=Buffer.alloc(O);
+let s=0,c=0,l=0,q=0,x=0,z=0;
+const d=e=>({stdout:o.subarray(0,l),exit:e}),t=d;
+for(;;){
+if(z===L)return t(10);
+if(x<0||x>=n)return t(9);
+const op=p[x],i=I[op];
+if(i<0)return t(5);
+if(x+i>=n)return t(9);
+z++;
+const y=x+1+i;
+if(s<P[op])return t(2);
+if(s-P[op]+U[op]>S)return t(3);
+x=y;
+switch(op){
+case 0:return d(0);
+case 1:D[s++]=(p[y-1]<<24)>>24;break;
+case 2:D[s++]=p[y-4]|p[y-3]<<8|p[y-2]<<16|p[y-1]<<24;break;
+case 3:s--;break;
+case 4:D[s]=D[s-1];s++;break;
+case 5:{const v=D[s-1];D[s-1]=D[s-2];D[s-2]=v;break}
+case 6:D[s]=D[s-2];s++;break;
+case 7:{const v=D[s-3];D[s-3]=D[s-2];D[s-2]=D[s-1];D[s-1]=v;break}
+case 23:D[s-1]=-D[s-1]|0;break;
+case 27:D[s-1]=~D[s-1];break;
+case 48:case 49:case 50:{
+const r=((p[y-2]|p[y-1]<<8)<<16)>>16;
+let k=!0;
+if(op!==48){const v=D[--s];k=op===49?v===0:v!==0}
+if(k)x=y+r;
+break}
+case 51:
+if(c===K)return t(7);
+C[c++]=y;x=p[y-2]|p[y-1]<<8;break;
+case 52:
+if(c===0)return t(8);
+x=C[--c];break;
+case 64:{
+const a=D[s-1];
+if(a<0||a>=256)return t(6);
+D[s-1]=M[a];break}
+case 65:{
+const a=D[s-1],v=D[s-2];
+if(a<0||a>=256)return t(6);
+s-=2;M[a]=v;break}
+case 80:{
+const w=Buffer.from(String(D[s-1]),'utf8');
+if(l+w.length>O)return t(11);
+s--;w.copy(o,l);l+=w.length;break}
+case 81:
+if(l+1>O)return t(11);
+o[l++]=D[--s]&255;break;
+case 82:D[s++]=q<b.length?b[q++]:-1;break;
+case 83:return d(D[--s]&255);
+default:{
+const v=D[s-1],a=D[s-2];
+if(op>=19&&op<=22&&v===0)return t(4);
+let r;
+switch(op){
+case 16:r=(a+v)|0;break;
+case 17:r=(a-v)|0;break;
+case 18:r=Math.imul(a,v);break;
+case 19:r=a===-2147483648&&v===-1?a:(a/v)|0;break;
+case 20:r=v===-1?0:a%v|0;break;
+case 21:r=Math.floor((a>>>0)/(v>>>0))|0;break;
+case 22:r=(a>>>0)%(v>>>0)|0;break;
+case 24:r=a&v;break;
+case 25:r=a|v;break;
+case 26:r=a^v;break;
+case 28:r=a<<(v&31);break;
+case 29:r=a>>(v&31);break;
+case 30:r=(a>>>(v&31))|0;break;
+case 32:r=a===v?1:0;break;
+case 33:r=a<v?1:0;break;
+default:r=(a>>>0)<(v>>>0)?1:0
 }
-
-const inputDir = process.env.MAKEFUN_INPUT_DIR || '/input';
-const outputDir = process.env.MAKEFUN_OUTPUT_DIR || '/output';
-fs.mkdirSync(outputDir, { recursive: true });
-for (const id of fs.readdirSync(inputDir)) {
-  const dir = path.join(inputDir, id);
-  if (!fs.statSync(dir).isDirectory()) continue;
-  const program = new Uint8Array(fs.readFileSync(path.join(dir, 'program.bin')));
-  const input = new Uint8Array(fs.readFileSync(path.join(dir, 'input.bin')));
-  const result = run(program, input);
-  const dest = path.join(outputDir, id);
-  fs.mkdirSync(dest, { recursive: true });
-  fs.writeFileSync(path.join(dest, 'stdout.bin'), result.stdout);
-  fs.writeFileSync(path.join(dest, 'exit.txt'), `${result.exit}\n`);
+s-=2;D[s++]=r;break
+}
+}
+}
+}
+const A=process.env.MAKEFUN_INPUT_DIR||'/input',B=process.env.MAKEFUN_OUTPUT_DIR||'/output';
+fs.mkdirSync(B,{recursive:true});
+for(const f of fs.readdirSync(A)){
+const j=path.join(A,f);
+if(!fs.statSync(j).isDirectory())continue;
+const g=new Uint8Array(fs.readFileSync(path.join(j,'program.bin')));
+const h=new Uint8Array(fs.readFileSync(path.join(j,'input.bin')));
+const r=run(g,h),v=path.join(B,f);
+fs.mkdirSync(v,{recursive:true});
+fs.writeFileSync(path.join(v,'stdout.bin'),r.stdout);
+fs.writeFileSync(path.join(v,'exit.txt'),`${r.exit}\n`);
 }
